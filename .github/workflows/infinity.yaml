@@ -1,0 +1,131 @@
+name: Port Infinity-X Lavender to Mido
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: "Direct download URL for Infinity-X lavender ROM"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            aria2 \
+            unzip \
+            zip \
+            p7zip-full \
+            lz4 \
+            zstd \
+            python3 \
+            file \
+            binutils \
+            android-sdk-libsparse-utils
+
+      - name: Download ROM
+        env:
+          ROM_URL: ${{ inputs.rom_url }}
+        run: |
+          mkdir -p work
+          cd work
+
+          aria2c \
+            --allow-overwrite=true \
+            --auto-file-renaming=false \
+            --max-connection-per-server=8 \
+            --split=8 \
+            --min-split-size=10M \
+            --summary-interval=30 \
+            --out=donor.zip \
+            "$ROM_URL"
+
+          test -s donor.zip
+          ls -lh donor.zip
+
+      - name: Check ZIP
+        run: |
+          cd work
+          unzip -t donor.zip
+          unzip -Z1 donor.zip | tee zip_contents.txt
+
+      - name: Extract ROM metadata
+        run: |
+          cd work
+          mkdir extracted
+          unzip -o donor.zip -d extracted
+
+          echo "=== Top-level files ==="
+          find extracted -maxdepth 2 -type f \
+            -printf '%p %s bytes\n' | sort
+
+          echo "=== Device and build properties ==="
+          find extracted -type f \
+            \( -name 'build.prop' \
+            -o -name 'default.prop' \
+            -o -name 'updater-script' \
+            -o -name 'metadata' \) \
+            -print
+
+      - name: Inspect images
+        run: |
+          cd work
+          mkdir -p image_info
+
+          find extracted -type f \
+            \( -name '*.img' \
+            -o -name '*.bin' \
+            -o -name '*.dat' \
+            -o -name '*.new.dat' \) \
+            -print > image_info/image_list.txt
+
+          while IFS= read -r img; do
+            echo "===== $img ====="
+            file "$img"
+            ls -lh "$img"
+          done < image_info/image_list.txt \
+            | tee image_info/image_report.txt
+
+      - name: Generate audit report
+        run: |
+          cd work
+
+          {
+            echo "Infinity-X Lavender ROM Audit"
+            echo "============================="
+            echo
+            echo "ZIP size:"
+            du -h donor.zip
+            echo
+            echo "ZIP contents:"
+            cat zip_contents.txt
+            echo
+            echo "Image report:"
+            cat image_info/image_report.txt
+            echo
+            echo "Image list:"
+            cat image_info/image_list.txt
+          } > audit_report.txt
+
+          cat audit_report.txt
+
+      - name: Upload audit results
+        uses: actions/upload-artifact@v4
+        with:
+          name: infinityx-lavender-audit
+          path: |
+            work/audit_report.txt
+            work/zip_contents.txt
+            work/image_info/
+            work/extracted/META-INF/
+          if-no-files-found: warn
+          retention-days: 7

@@ -1,0 +1,118 @@
+name: Inspect ROM & Vendor mido
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: 'Direct URL to Infinity X ROM zip'
+        required: true
+        type: string
+
+jobs:
+  inspect:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost
+          sudo apt clean
+          df -h /
+
+      - name: Install tools
+        run: |
+          sudo apt update
+          sudo apt install -y zip unzip p7zip-full python3 python3-pip \
+            e2fsprogs erofs-utils brotli lz4 android-sdk-libsparse-utils
+          pip install --upgrade pip
+
+          # payload-dumper-go
+          URL=$(curl -s https://api.github.com/repos/ssut/payload-dumper-go/releases/latest \
+            | grep browser_download_url | grep linux_amd64 | cut -d '"' -f4)
+          wget -q "$URL" -O pdg.tar.gz
+          tar xzf pdg.tar.gz
+          sudo mv payload-dumper-go /usr/local/bin/
+          payload-dumper-go --version
+
+      - name: Download ROM
+        run: |
+          mkdir -p work/rom
+          wget -q --show-progress -O rom.zip "${{ inputs.rom_url }}"
+          7z x -y rom.zip -owork/rom > /dev/null
+
+          # payload.bin
+          if [ -f work/rom/payload.bin ]; then
+            echo "[+] payload.bin detected, extracting..."
+            mkdir -p work/payload_out
+            payload-dumper-go -o work/payload_out \
+              -p system,vendor,product,system_ext,boot \
+              work/rom/payload.bin
+
+            mkdir -p work/flat/system work/flat/vendor \
+                     work/flat/product work/flat/system_ext
+
+            for img in work/payload_out/*.img; do
+              [ -e "$img" ] || continue
+              name=$(basename "$img" .img)
+              echo "  -> $name"
+              if sudo mount -o loop,ro "$img" "/mnt/$name" 2>/dev/null; then
+                cp -a "/mnt/$name/." "work/flat/$name/"
+                sudo umount "/mnt/$name"
+              else
+                # erofs fallback
+                sudo fsck.erofs --extract="work/flat/$name" "$img" 2>/dev/null || \
+                echo "    (failed to mount/extract $name)"
+              fi
+            done
+          fi
+
+          # dat.br
+          for f in system vendor product system_ext; do
+            if [ -f "work/rom/${f}.new.dat.br" ]; then
+              echo "[+] ${f}.new.dat.br detected"
+              brotli -d "work/rom/${f}.new.dat.br" -o "work/rom/${f}.new.dat"
+              # sdat2img
+              if command -v sdat2img >/dev/null; then
+                sdat2img "work/rom/${f}.transfer.list" "work/rom/${f}.new.dat" "work/flat/${f}.img"
+                sudo mkdir -p "work/flat/$f"
+                sudo mount -o loop,ro "work/flat/${f}.img" "/mnt/$f" 2>/dev/null && \
+                  cp -a "/mnt/$f/." "work/flat/$f/" && sudo umount "/mnt/$f"
+              fi
+            fi
+          done
+
+          echo "=== work/flat ==="
+          ls -la work/flat/ 2>/dev/null || true
+
+      - name: Clone vendor repo
+        run: |
+          git clone --depth 1 https://github.com/NRanjan-17/vendor_xiaomi_mido work/vendor_repo
+          echo "=== vendor_repo top level ==="
+          ls -la work/vendor_repo/
+
+      - name: Run inspection
+        run: |
+          mkdir -p report
+          python3 scripts/inspect.py work report
+
+      - name: Print summary
+        run: |
+          echo "===== SUMMARY ====="
+          cat report/summary.txt 2>/dev/null || echo "no summary"
+          echo ""
+          echo "===== HW FILES IN ROM ====="
+          cat report/hw_files_rom.txt 2>/dev/null || true
+          echo ""
+          echo "===== HW FILES IN VENDOR ====="
+          cat report/hw_files_vendor.txt 2>/dev/null || true
+          echo ""
+          echo "===== MISSING IN ROM (present in vendor) ====="
+          cat report/missing_in_rom.txt 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inspection-report
+          path: report/
+          retention-days: 5

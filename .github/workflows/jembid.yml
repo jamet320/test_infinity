@@ -1,4 +1,4 @@
-name: Auto Port ROM (Artifact)
+name: Auto Port ROM (With Log & Check)
 
 # Trigger manual dengan input link
 on:
@@ -33,7 +33,6 @@ jobs:
     - name: Download Base ROM (mido)
       run: |
         echo "Mendownload Base ROM..."
-        # Menggunakan -sL (silent) agar log download tidak nge-spam dan bikin HP lag/black screen
         curl -sL "${{ github.event.inputs.base_url }}" -o base.zip
 
     - name: Download Port ROM (Infinity X)
@@ -49,23 +48,64 @@ jobs:
         echo "Mengekstrak Port ROM..."
         unzip -q port.zip -d port_folder
 
+    - name: Deteksi Jenis ROM dan Buat Log
+      run: |
+        echo "=== LAPORAN PROSES PORTING ROM ===" > build_log.txt
+        echo "Tanggal: $(date)" >> build_log.txt
+        echo "==================================" >> build_log.txt
+        
+        echo "[INFO BASE ROM (mido)]" >> build_log.txt
+        if [ -f "base_folder/payload.bin" ]; then
+          echo "-> Tipe: DYNAMIC (Terdapat file payload.bin)" >> build_log.txt
+        elif ls base_folder/system.new.dat* 1> /dev/null 2>&1; then
+          echo "-> Tipe: NON-DYNAMIC (Format konvensional / .dat.br)" >> build_log.txt
+        else
+          echo "-> Tipe: TIDAK DIKETAHUI / Struktur tidak standar" >> build_log.txt
+        fi
+        
+        echo "" >> build_log.txt
+        echo "[INFO PORT ROM (Infinity X)]" >> build_log.txt
+        if [ -f "port_folder/payload.bin" ]; then
+          echo "-> Tipe: DYNAMIC (Terdapat file payload.bin)" >> build_log.txt
+          echo "!! PERINGATAN: Port ROM menggunakan payload.bin. Script ini hanya bisa memindah format non-dynamic. Proses porting kemungkinan besar akan GAGAL !!" >> build_log.txt
+        elif ls port_folder/system.new.dat* 1> /dev/null 2>&1; then
+          echo "-> Tipe: NON-DYNAMIC (Format konvensional / .dat.br)" >> build_log.txt
+        else
+          echo "-> Tipe: TIDAK DIKETAHUI / Struktur tidak standar" >> build_log.txt
+        fi
+        
+        echo "==================================" >> build_log.txt
+
     - name: Proses Porting (Oplos Partisi System)
       run: |
-        echo "Menghapus file system lama di Base ROM..."
-        rm -f base_folder/system.new.dat* 
-        rm -f base_folder/system.transfer.list 
-        rm -f base_folder/system.patch.dat
+        echo "[PROSES PEMINDAHAN FILE]" >> build_log.txt
+        
+        # Hapus file sistem lama di base_folder
+        echo "-> Menghapus partisi system lama di Base ROM..." >> build_log.txt
+        rm -f base_folder/system.new.dat* base_folder/system.transfer.list base_folder/system.patch.dat
+        rm -f base_folder/product.new.dat* base_folder/product.transfer.list base_folder/product.patch.dat
+        rm -f base_folder/system_ext.new.dat* base_folder/system_ext.transfer.list base_folder/system_ext.patch.dat
 
-        echo "Memindahkan file system dari Port ROM ke Base ROM..."
-        cp port_folder/system.new.dat* base_folder/
-        cp port_folder/system.transfer.list base_folder/
-        cp port_folder/system.patch.dat base_folder/
+        # Pindahkan file dari port_folder ke base_folder dengan log dinamis
+        for part in system product system_ext; do
+          if ls port_folder/${part}.new.dat* 1> /dev/null 2>&1; then
+            echo "-> Partisi [${part}] DITEMUKAN di Port ROM. Memindahkan ke Base ROM..." >> build_log.txt
+            cp port_folder/${part}.new.dat* base_folder/ 2>/dev/null || true
+            cp port_folder/${part}.transfer.list base_folder/ 2>/dev/null || true
+            cp port_folder/${part}.patch.dat base_folder/ 2>/dev/null || true
+          else
+            echo "-> Partisi [${part}] TIDAK ADA di Port ROM. Diabaikan." >> build_log.txt
+          fi
+        done
+        
+        echo "==================================" >> build_log.txt
 
     - name: Hapus Device Check di Updater-Script
       run: |
         SCRIPT_PATH="base_folder/META-INF/com/google/android/updater-script"
         if [ -f "$SCRIPT_PATH" ]; then
-          echo "Memodifikasi updater-script..."
+          echo "[MODIFIKASI UPDATER-SCRIPT]" >> build_log.txt
+          echo "-> Menghapus pengecekan device (assert/getprop) agar bisa di-flash di mido." >> build_log.txt
           sed -i '/getprop/d' "$SCRIPT_PATH"
           sed -i '/assert/d' "$SCRIPT_PATH"
         fi
@@ -74,11 +114,17 @@ jobs:
       run: |
         echo "Membungkus kembali ROM..."
         cd base_folder
-        # Menggunakan opsi 'q' (quiet) agar tidak mencetak ribuan nama file ke layar
         zip -r1q ../${{ github.event.inputs.release_name }}.zip ./*
+        
+        cd ..
+        echo "-> Proses packing zip selesai!" >> build_log.txt
+        echo "Ukuran File Akhir: $(du -sh ${{ github.event.inputs.release_name }}.zip | cut -f1)" >> build_log.txt
 
-    - name: Upload Hasil Porting sebagai Artifact
+    - name: Upload Hasil Porting & Log sebagai Artifact
       uses: actions/upload-artifact@v4
       with:
         name: ROM-Hasil-Porting
-        path: ${{ github.event.inputs.release_name }}.zip
+        # Memasukkan file zip dan txt sekaligus menggunakan multi-line input (|)
+        path: |
+          ${{ github.event.inputs.release_name }}.zip
+          build_log.txt

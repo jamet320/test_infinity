@@ -1,118 +1,204 @@
-name: Inspect ROM & Vendor mido
+name: Audit ROM for mido port
 
 on:
   workflow_dispatch:
     inputs:
       rom_url:
-        description: 'Direct URL to Infinity X ROM zip'
+        description: "Direct download URL for donor ROM"
         required: true
         type: string
+      vendor_repo:
+        description: "Vendor repo URL for mido"
+        required: true
+        default: "https://github.com/NRanjan-17/vendor_xiaomi_mido"
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
-  inspect:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 90
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Free disk space
+      - name: Install dependencies
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost
-          sudo apt clean
-          df -h /
+          sudo apt-get update
+          sudo apt-get install -y \
+            aria2 unzip zip p7zip-full lz4 zstd \
+            python3 file binutils git \
+            android-sdk-libsparse-utils
 
-      - name: Install tools
+      - name: Download donor ROM
+        env:
+          ROM_URL: ${{ inputs.rom_url }}
         run: |
-          sudo apt update
-          sudo apt install -y zip unzip p7zip-full python3 python3-pip \
-            e2fsprogs erofs-utils brotli lz4 android-sdk-libsparse-utils
-          pip install --upgrade pip
+          mkdir -p work
+          cd work
+          aria2c \
+            --allow-overwrite=true \
+            --auto-file-renaming=false \
+            --max-connection-per-server=8 \
+            --split=8 \
+            --min-split-size=10M \
+            --summary-interval=30 \
+            --out=donor.zip \
+            "$ROM_URL"
+          test -s donor.zip
+          ls -lh donor.zip
 
-          # payload-dumper-go
-          URL=$(curl -s https://api.github.com/repos/ssut/payload-dumper-go/releases/latest \
-            | grep browser_download_url | grep linux_amd64 | cut -d '"' -f4)
-          wget -q "$URL" -O pdg.tar.gz
-          tar xzf pdg.tar.gz
-          sudo mv payload-dumper-go /usr/local/bin/
-          payload-dumper-go --version
-
-      - name: Download ROM
+      - name: Verify ZIP
         run: |
-          mkdir -p work/rom
-          wget -q --show-progress -O rom.zip "${{ inputs.rom_url }}"
-          7z x -y rom.zip -owork/rom > /dev/null
+          cd work
+          unzip -t donor.zip
+          unzip -Z1 donor.zip | tee zip_contents.txt
 
-          # payload.bin
-          if [ -f work/rom/payload.bin ]; then
-            echo "[+] payload.bin detected, extracting..."
-            mkdir -p work/payload_out
-            payload-dumper-go -o work/payload_out \
-              -p system,vendor,product,system_ext,boot \
-              work/rom/payload.bin
-
-            mkdir -p work/flat/system work/flat/vendor \
-                     work/flat/product work/flat/system_ext
-
-            for img in work/payload_out/*.img; do
-              [ -e "$img" ] || continue
-              name=$(basename "$img" .img)
-              echo "  -> $name"
-              if sudo mount -o loop,ro "$img" "/mnt/$name" 2>/dev/null; then
-                cp -a "/mnt/$name/." "work/flat/$name/"
-                sudo umount "/mnt/$name"
-              else
-                # erofs fallback
-                sudo fsck.erofs --extract="work/flat/$name" "$img" 2>/dev/null || \
-                echo "    (failed to mount/extract $name)"
-              fi
-            done
-          fi
-
-          # dat.br
-          for f in system vendor product system_ext; do
-            if [ -f "work/rom/${f}.new.dat.br" ]; then
-              echo "[+] ${f}.new.dat.br detected"
-              brotli -d "work/rom/${f}.new.dat.br" -o "work/rom/${f}.new.dat"
-              # sdat2img
-              if command -v sdat2img >/dev/null; then
-                sdat2img "work/rom/${f}.transfer.list" "work/rom/${f}.new.dat" "work/flat/${f}.img"
-                sudo mkdir -p "work/flat/$f"
-                sudo mount -o loop,ro "work/flat/${f}.img" "/mnt/$f" 2>/dev/null && \
-                  cp -a "/mnt/$f/." "work/flat/$f/" && sudo umount "/mnt/$f"
-              fi
-            fi
-          done
-
-          echo "=== work/flat ==="
-          ls -la work/flat/ 2>/dev/null || true
-
-      - name: Clone vendor repo
+      - name: Extract ROM
         run: |
-          git clone --depth 1 https://github.com/NRanjan-17/vendor_xiaomi_mido work/vendor_repo
-          echo "=== vendor_repo top level ==="
-          ls -la work/vendor_repo/
+          cd work
+          mkdir -p extracted
+          unzip -o donor.zip -d extracted
+          find extracted -maxdepth 3 -type f -printf '%p %s\n' | sort > file_tree.txt
 
-      - name: Run inspection
+      - name: Inspect images
         run: |
-          mkdir -p report
-          python3 scripts/inspect.py work report
+          cd work
+          mkdir -p image_info
+          find extracted -type f \
+            \( -name '*.img' -o -name '*.bin' -o -name '*.dat' -o -name '*.new.dat' -o -name '*.new.dat.br' \) \
+            -print > image_info/image_list.txt
 
-      - name: Print summary
+          while IFS= read -r img; do
+            echo "===== $img ====="
+            file "$img"
+            ls -lh "$img"
+            echo
+          done < image_info/image_list.txt > image_info/image_report.txt
+
+          cat image_info/image_report.txt
+
+      - name: Dump metadata & props
         run: |
-          echo "===== SUMMARY ====="
-          cat report/summary.txt 2>/dev/null || echo "no summary"
-          echo ""
-          echo "===== HW FILES IN ROM ====="
-          cat report/hw_files_rom.txt 2>/dev/null || true
-          echo ""
-          echo "===== HW FILES IN VENDOR ====="
-          cat report/hw_files_vendor.txt 2>/dev/null || true
-          echo ""
-          echo "===== MISSING IN ROM (present in vendor) ====="
-          cat report/missing_in_rom.txt 2>/dev/null || true
+          cd work
+          mkdir -p metadata
+
+          # build.prop / default.prop
+          find extracted -type f \( -name 'build.prop' -o -name 'default.prop' \) \
+            -exec sh -c 'echo "### $1"; cat "$1"; echo' _ {} \; > metadata/props.txt
+
+          # updater-script
+          find extracted -path '*com/google/android/updater-script' \
+            -exec sh -c 'echo "### $1"; cat "$1"' _ {} \; > metadata/updater-script.txt
+
+          # metadata (if exists)
+          find extracted -name 'metadata' -type f \
+            -exec sh -c 'echo "### $1"; strings "$1" | head -50' _ {} \; > metadata/metadata.txt
+
+          echo "=== props.txt ==="
+          cat metadata/props.txt
+
+          echo "=== updater-script.txt ==="
+          cat metadata/updater-script.txt
+
+          echo "=== metadata.txt ==="
+          cat metadata/metadata.txt
+
+      - name: Clone vendor mido
+        run: |
+          cd work
+          git clone --depth 1 "${{ inputs.vendor_repo }}" vendor_repo
+          find vendor_repo -type f | sort > vendor_files.txt
+          echo "=== vendor top level ==="
+          ls -la vendor_repo/
+
+      - name: Hardware layer diff
+        run: |
+          cd work
+          python3 - <<'PY'
+          import re, os
+          from pathlib import Path
+
+          HW = re.compile(
+              r'(libcamera|libwifi|libril|libsensor|libbt|libgnss|libaudio|'
+              r'libmmcamera|libloc|libqmi|libqti|libdisplay|libgralloc|'
+              r'libmemalloc|libqdutils|libsdm|manifest\.xml|file_contexts|'
+              r'property_contexts|hwservice_contexts|init\..*\.rc|fstab|'
+              r'mixer_paths|thermal|media_codecs|audio.*\.xml)', re.I
+          )
+
+          def walk(root):
+              p = Path(root)
+              if not p.exists(): return []
+              return sorted(str(f.relative_to(p)) for f in p.rglob('*') if f.is_file())
+
+          rom_files = walk('extracted')
+          vendor_files = walk('vendor_repo')
+
+          rom_hw = [f for f in rom_files if HW.search(f)]
+          vendor_hw = [f for f in vendor_files if HW.search(f)]
+
+          Path('hw_rom.txt').write_text('\n'.join(rom_hw))
+          Path('hw_vendor.txt').write_text('\n'.join(vendor_hw))
+
+          rom_names = {os.path.basename(f) for f in rom_hw}
+          vendor_names = {os.path.basename(f) for f in vendor_hw}
+          missing = sorted(vendor_names - rom_names)
+
+          Path('hw_missing_in_rom.txt').write_text('\n'.join(missing))
+
+          with open('summary.txt','w') as s:
+              s.write(f"ROM files: {len(rom_files)}\n")
+              s.write(f"Vendor files: {len(vendor_files)}\n\n")
+              s.write(f"HW files in ROM: {len(rom_hw)}\n")
+              s.write(f"HW files in vendor: {len(vendor_hw)}\n")
+              s.write(f"HW in vendor but not in ROM: {len(missing)}\n\n")
+              for p in ['system','vendor','product','system_ext','boot.img','payload.bin']:
+                  exists = any(p == f or f.startswith(p+'/') for f in rom_files)
+                  s.write(f"  {p}: {'YES' if exists else 'no'}\n")
+
+          print(open('summary.txt').read())
+          print("=== hw_missing_in_rom.txt (first 100) ===")
+          print('\n'.join(missing[:100]))
+          PY
+
+      - name: Build report
+        run: |
+          cd work
+          {
+            echo "=== ZIP CONTENTS ==="
+            cat zip_contents.txt
+            echo
+            echo "=== FILE TREE ==="
+            cat file_tree.txt
+            echo
+            echo "=== IMAGE REPORT ==="
+            cat image_info/image_report.txt
+            echo
+            echo "=== PROPS ==="
+            cat metadata/props.txt
+            echo
+            echo "=== UPDATER-SCRIPT ==="
+            cat metadata/updater-script.txt
+            echo
+            echo "=== SUMMARY ==="
+            cat summary.txt
+            echo
+            echo "=== HW MISSING IN ROM ==="
+            cat hw_missing_in_rom.txt
+          } > audit_report.txt
+          ls -lh audit_report.txt
 
       - uses: actions/upload-artifact@v4
         with:
-          name: inspection-report
-          path: report/
-          retention-days: 5
+          name: audit-report
+          path: |
+            work/audit_report.txt
+            work/summary.txt
+            work/hw_rom.txt
+            work/hw_vendor.txt
+            work/hw_missing_in_rom.txt
+            work/metadata/
+            work/extracted/META-INF/
+          if-no-files-found: warn
+          retention-days: 7

@@ -1,0 +1,64 @@
+name: Check ROM Dynamic
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: "Direct download URL ROM (.zip)"
+        required: true
+        type: string
+
+jobs:
+  check-rom:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Download ROM
+        run: |
+          mkdir -p rom
+          cd rom
+          curl -L --fail --retry 3 \
+            "${{ inputs.rom_url }}" \
+            -o rom.zip
+
+      - name: Check ROM format
+        run: |
+          cd rom
+
+          echo "=== ROM FILE ==="
+          ls -lh rom.zip
+
+          echo "=== CHECKING ROM ==="
+
+          if unzip -Z1 rom.zip > files.txt; then
+            echo "ZIP valid"
+          else
+            echo "ERROR: Invalid ZIP"
+            exit 1
+          fi
+
+          echo "=== PARTITION FORMAT ==="
+
+          if grep -Eq '(^|/)payload\.bin$' files.txt; then
+            echo "RESULT: DYNAMIC ROM"
+            echo "Found payload.bin"
+
+          elif grep -Eq '(^|/)super\.img$' files.txt; then
+            echo "RESULT: DYNAMIC ROM"
+            echo "Found super.img"
+
+          elif grep -Eq '(^|/)system\.new\.dat(\.br)?$' files.txt; then
+            echo "RESULT: NON-DYNAMIC ROM"
+            echo "Found system.new.dat"
+
+          elif grep -Eq '(^|/)system\.img$' files.txt; then
+            echo "RESULT: CHECK REQUIRED"
+            echo "Found system.img; inspect partition metadata."
+
+          else
+            echo "RESULT: UNKNOWN"
+            echo "No recognized partition format found."
+          fi
+
+          echo "=== PARTITION FILES ==="
+          grep -Ei 'payload\.bin|super\.img|system(\.new\.dat(\.br)?|\.img)|product(\.new\.dat(\.br)?|\.img)|system_ext(\.new\.dat(\.br)?|\.img)' files.txt || true

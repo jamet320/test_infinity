@@ -1,4 +1,4 @@
-name: Audit ROM for mido port
+name: Audit & Extract donor ROM for mido port
 
 on:
   workflow_dispatch:
@@ -19,112 +19,130 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            aria2 unzip zip p7zip-full lz4 zstd \
-            python3 file binutils git \
-            android-sdk-libsparse-utils
+            aria2 unzip zip p7zip-full brotli lz4 zstd \
+            python3 python3-pip file binutils git \
+            android-sdk-libsparse-utils e2fsprogs
+          curl -sL https://raw.githubusercontent.com/xpirt/sdat2img/master/sdat2img.py -o /tmp/sdat2img.py
+          git clone --depth 1 https://github.com/osm0sis/mkbootimg /tmp/mkbootimg
+          chmod +x /tmp/mkbootimg/unpackbootimg
 
       - name: Download donor ROM
         env:
           ROM_URL: ${{ inputs.rom_url }}
         run: |
-          mkdir -p work
-          cd work
-          aria2c \
-            --allow-overwrite=true \
-            --auto-file-renaming=false \
-            --max-connection-per-server=8 \
-            --split=8 \
-            --min-split-size=10M \
-            --summary-interval=30 \
-            --out=donor.zip \
-            "$ROM_URL"
+          mkdir -p work && cd work
+          aria2c --allow-overwrite=true --auto-file-renaming=false \
+            --max-connection-per-server=8 --split=8 --min-split-size=10M \
+            --summary-interval=30 --out=donor.zip "$ROM_URL"
           test -s donor.zip
           ls -lh donor.zip
 
-      - name: Verify ZIP
+      - name: Verify ZIP & list contents
         run: |
           cd work
+          echo "===== ZIP TEST ====="
           unzip -t donor.zip
+          echo ""
+          echo "===== ZIP CONTENTS ====="
           unzip -Z1 donor.zip | tee zip_contents.txt
 
       - name: Extract ROM
         run: |
           cd work
-          mkdir -p extracted
-          unzip -o donor.zip -d extracted
-          find extracted -maxdepth 3 -type f -printf '%p %s\n' | sort > file_tree.txt
+          mkdir -p donor
+          unzip -o donor.zip -d donor
+          echo "===== FILE TREE (maxdepth 3) ====="
+          find donor -maxdepth 3 -type f -printf '%p %s\n' | sort
 
-      - name: Inspect images
+      - name: Inspect image types
         run: |
           cd work
-          mkdir -p image_info
-          find extracted -type f \
+          echo "===== IMAGE TYPE REPORT ====="
+          find donor -type f \
             \( -name '*.img' -o -name '*.bin' -o -name '*.dat' -o -name '*.new.dat' -o -name '*.new.dat.br' \) \
-            -print > image_info/image_list.txt
+            | sort | while IFS= read -r img; do
+              echo "----- $img -----"
+              file "$img"
+              ls -lh "$img"
+              echo
+            done
 
-          while IFS= read -r img; do
-            echo "===== $img ====="
-            file "$img"
-            ls -lh "$img"
-            echo
-          done < image_info/image_list.txt > image_info/image_report.txt
-
-          cat image_info/image_report.txt
-
-      - name: Dump metadata & props
+      - name: Dump metadata & updater-script
         run: |
           cd work
-          mkdir -p metadata
+          echo "===== PROPS ====="
+          find donor -type f \( -name 'build.prop' -o -name 'default.prop' \) \
+            -exec sh -c 'echo "### $1"; cat "$1"; echo' _ {} \;
 
-          # build.prop / default.prop
-          find extracted -type f \( -name 'build.prop' -o -name 'default.prop' \) \
-            -exec sh -c 'echo "### $1"; cat "$1"; echo' _ {} \; > metadata/props.txt
+          echo ""
+          echo "===== UPDATER-SCRIPT ====="
+          find donor -path '*com/google/android/updater-script' \
+            -exec cat {} \;
 
-          # updater-script
-          find extracted -path '*com/google/android/updater-script' \
-            -exec sh -c 'echo "### $1"; cat "$1"' _ {} \; > metadata/updater-script.txt
+          echo ""
+          echo "===== METADATA ====="
+          find donor -name 'metadata' -type f \
+            -exec sh -c 'echo "### $1"; cat "$1"' _ {} \;
 
-          # metadata (if exists)
-          find extracted -name 'metadata' -type f \
-            -exec sh -c 'echo "### $1"; strings "$1" | head -50' _ {} \; > metadata/metadata.txt
-
-          echo "=== props.txt ==="
-          cat metadata/props.txt
-
-          echo "=== updater-script.txt ==="
-          cat metadata/updater-script.txt
-
-          echo "=== metadata.txt ==="
-          cat metadata/metadata.txt
-
-      - name: Clone vendor mido
+      - name: Extract .new.dat.br to raw images
         run: |
           cd work
-          git clone --depth 1 "${{ inputs.vendor_repo }}" vendor_repo
-          find vendor_repo -type f | sort > vendor_files.txt
-          echo "=== vendor top level ==="
-          ls -la vendor_repo/
+          mkdir -p img
+          for part in system vendor product system_ext odm; do
+            [ -f "donor/${part}.new.dat.br" ] || continue
+            echo "===== $part ====="
+            brotli -d "donor/${part}.new.dat.br" -o "img/${part}.new.dat"
+            python3 /tmp/sdat2img.py \
+              "donor/${part}.transfer.list" \
+              "img/${part}.new.dat" \
+              "img/${part}.img"
+            simg2img "img/${part}.img" "img/${part}.raw.img" 2>/dev/null || \
+              cp "img/${part}.img" "img/${part}.raw.img"
+            ls -lh "img/${part}".*.img
+          done
 
-      - name: Hardware layer diff
+      - name: Dump partition contents
+        run: |
+          cd work
+          mkdir -p dump
+          for img in img/system.raw.img img/vendor.raw.img \
+                     img/product.raw.img img/system_ext.raw.img img/odm.raw.img; do
+            [ -f "$img" ] || continue
+            name=$(basename "$img" .raw.img)
+            echo "===== dumping $name ====="
+            mkdir -p "dump/$name"
+            debugfs -R "rdump / dump/$name" "$img" 2>/dev/null || \
+              echo "  debugfs failed for $name"
+            echo "  files: $(find dump/$name -type f 2>/dev/null | wc -l)"
+          done
+
+          if [ -f donor/boot.img ]; then
+            echo "===== unpacking boot.img ====="
+            /tmp/mkbootimg/unpackbootimg -i donor/boot.img -o dump/boot 2>/dev/null || true
+            ls -la dump/boot/ 2>/dev/null || true
+          fi
+
+      - name: Hardware layer report - donor
         run: |
           cd work
           python3 - <<'PY'
-          import re, os
+          import re
           from pathlib import Path
 
           HW = re.compile(
               r'(libcamera|libwifi|libril|libsensor|libbt|libgnss|libaudio|'
               r'libmmcamera|libloc|libqmi|libqti|libdisplay|libgralloc|'
-              r'libmemalloc|libqdutils|libsdm|manifest\.xml|file_contexts|'
-              r'property_contexts|hwservice_contexts|init\..*\.rc|fstab|'
-              r'mixer_paths|thermal|media_codecs|audio.*\.xml)', re.I
+              r'libmemalloc|libqdutils|libsdm|libthermal|libsensor1|'
+              r'manifest\.xml|file_contexts|property_contexts|'
+              r'hwservice_contexts|init\..*\.rc|fstab|mixer_paths|'
+              r'thermal|media_codecs|audio.*\.xml|qcrild)', re.I
           )
 
           def walk(root):
@@ -132,73 +150,82 @@ jobs:
               if not p.exists(): return []
               return sorted(str(f.relative_to(p)) for f in p.rglob('*') if f.is_file())
 
-          rom_files = walk('extracted')
-          vendor_files = walk('vendor_repo')
+          parts = ['system','vendor','product','system_ext','odm']
+          all_files = []
+          for p in parts:
+              all_files += [f"{p}/{f}" for f in walk(f'dump/{p}')]
 
-          rom_hw = [f for f in rom_files if HW.search(f)]
-          vendor_hw = [f for f in vendor_files if HW.search(f)]
+          hw = [f for f in all_files if HW.search(f)]
 
-          Path('hw_rom.txt').write_text('\n'.join(rom_hw))
-          Path('hw_vendor.txt').write_text('\n'.join(vendor_hw))
+          print("===== PARTITION LAYOUT =====")
+          for p in parts:
+              files = walk(f'dump/{p}')
+              print(f"\n--- {p} ({len(files)} files) ---")
+              top = sorted({f.split('/')[0] for f in files})
+              for t in top[:60]:
+                  print(f"  {t}")
 
-          rom_names = {os.path.basename(f) for f in rom_hw}
-          vendor_names = {os.path.basename(f) for f in vendor_hw}
-          missing = sorted(vendor_names - rom_names)
+          print("\n===== DONOR HW FILES =====")
+          for f in hw:
+              print(f)
 
-          Path('hw_missing_in_rom.txt').write_text('\n'.join(missing))
-
-          with open('summary.txt','w') as s:
-              s.write(f"ROM files: {len(rom_files)}\n")
-              s.write(f"Vendor files: {len(vendor_files)}\n\n")
-              s.write(f"HW files in ROM: {len(rom_hw)}\n")
-              s.write(f"HW files in vendor: {len(vendor_hw)}\n")
-              s.write(f"HW in vendor but not in ROM: {len(missing)}\n\n")
-              for p in ['system','vendor','product','system_ext','boot.img','payload.bin']:
-                  exists = any(p == f or f.startswith(p+'/') for f in rom_files)
-                  s.write(f"  {p}: {'YES' if exists else 'no'}\n")
-
-          print(open('summary.txt').read())
-          print("=== hw_missing_in_rom.txt (first 100) ===")
-          print('\n'.join(missing[:100]))
+          print(f"\nTotal HW files: {len(hw)}")
           PY
 
-      - name: Build report
+      - name: Clone vendor mido & hardware report - vendor
+        env:
+          VENDOR_REPO: ${{ inputs.vendor_repo }}
         run: |
           cd work
-          {
-            echo "=== ZIP CONTENTS ==="
-            cat zip_contents.txt
-            echo
-            echo "=== FILE TREE ==="
-            cat file_tree.txt
-            echo
-            echo "=== IMAGE REPORT ==="
-            cat image_info/image_report.txt
-            echo
-            echo "=== PROPS ==="
-            cat metadata/props.txt
-            echo
-            echo "=== UPDATER-SCRIPT ==="
-            cat metadata/updater-script.txt
-            echo
-            echo "=== SUMMARY ==="
-            cat summary.txt
-            echo
-            echo "=== HW MISSING IN ROM ==="
-            cat hw_missing_in_rom.txt
-          } > audit_report.txt
-          ls -lh audit_report.txt
+          git clone --depth 1 "$VENDOR_REPO" vendor_repo
+          echo "===== VENDOR TOP LEVEL ====="
+          ls -la vendor_repo/
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: audit-report
-          path: |
-            work/audit_report.txt
-            work/summary.txt
-            work/hw_rom.txt
-            work/hw_vendor.txt
-            work/hw_missing_in_rom.txt
-            work/metadata/
-            work/extracted/META-INF/
-          if-no-files-found: warn
-          retention-days: 7
+          python3 - <<'PY'
+          import re, os
+          from pathlib import Path
+
+          HW = re.compile(
+              r'(libcamera|libwifi|libril|libsensor|libbt|libgnss|libaudio|'
+              r'libmmcamera|libloc|libqmi|libqti|libdisplay|libgralloc|'
+              r'libmemalloc|libqdutils|libsdm|libthermal|libsensor1|'
+              r'manifest\.xml|file_contexts|property_contexts|'
+              r'hwservice_contexts|init\..*\.rc|fstab|mixer_paths|'
+              r'thermal|media_codecs|audio.*\.xml|qcrild)', re.I
+          )
+
+          def walk(root):
+              p = Path(root)
+              if not p.exists(): return []
+              return sorted(str(f.relative_to(p)) for f in p.rglob('*') if f.is_file())
+
+          vendor_files = walk('vendor_repo')
+          vendor_hw = [f for f in vendor_files if HW.search(f)]
+
+          print("===== VENDOR HW FILES =====")
+          for f in vendor_hw:
+              print(f)
+          print(f"\nTotal vendor HW files: {len(vendor_hw)}")
+
+          # Donor HW basenames
+          donor_hw = []
+          for p in ['system','vendor','product','system_ext','odm']:
+              for f in walk(f'dump/{p}'):
+                  if HW.search(f):
+                      donor_hw.append(f)
+          donor_names = {os.path.basename(f) for f in donor_hw}
+          vendor_names = {os.path.basename(f) for f in vendor_hw}
+
+          missing = sorted(vendor_names - donor_names)
+          print("\n===== HW IN VENDOR BUT NOT IN DONOR =====")
+          for f in missing:
+              print(f)
+          print(f"\nTotal missing: {len(missing)}")
+
+          # Files in donor HW but not in vendor (kandidat yang perlu di-keep dari donor)
+          extra = sorted(donor_names - vendor_names)
+          print("\n===== HW IN DONOR BUT NOT IN VENDOR =====")
+          for f in extra:
+              print(f)
+          print(f"\nTotal extra: {len(extra)}")
+          PY

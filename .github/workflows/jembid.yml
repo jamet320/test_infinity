@@ -1,227 +1,92 @@
-name: Audit & Extract donor ROM for mido port
+name: Auto Port ROM (Direct Link)
 
+# Trigger manual dengan input link
 on:
   workflow_dispatch:
     inputs:
-      rom_url:
-        description: "Direct download URL for donor ROM"
+      base_url:
+        description: 'Link Direct Base ROM (mido) - cth: GitHub Release'
         required: true
-        type: string
-      vendor_repo:
-        description: "Vendor repo URL for mido"
+      port_url:
+        description: 'Link Direct Port ROM (Infinity X)'
         required: true
-        default: "https://github.com/NRanjan-17/vendor_xiaomi_mido"
-        type: string
-
-permissions:
-  contents: read
+      release_name:
+        description: 'Nama file hasil porting (tanpa .zip)'
+        required: true
+        default: 'Port-InfinityX-Mido'
 
 jobs:
-  audit:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Wajib agar bot bisa upload ke Releases
 
     steps:
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            aria2 unzip zip p7zip-full brotli lz4 zstd \
-            python3 python3-pip file binutils git \
-            android-sdk-libsparse-utils e2fsprogs abootimg
-          curl -sL https://raw.githubusercontent.com/xpirt/sdat2img/master/sdat2img.py -o /tmp/sdat2img.py
+    - name: Kosongkan Storage Server (Mencegah out of space)
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        df -h
 
-      - name: Download donor ROM
-        env:
-          ROM_URL: ${{ inputs.rom_url }}
-        run: |
-          mkdir -p work && cd work
-          aria2c --allow-overwrite=true --auto-file-renaming=false \
-            --max-connection-per-server=8 --split=8 --min-split-size=10M \
-            --summary-interval=30 --out=donor.zip "$ROM_URL"
-          test -s donor.zip
-          ls -lh donor.zip
+    - name: Setup & Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y zip unzip curl
 
-      - name: Verify ZIP & list contents
-        run: |
-          cd work
-          echo "===== ZIP TEST ====="
-          unzip -t donor.zip
-          echo ""
-          echo "===== ZIP CONTENTS ====="
-          unzip -Z1 donor.zip | tee zip_contents.txt
+    - name: Download Base ROM (mido)
+      run: |
+        echo "Mendownload Base ROM..."
+        # Menggunakan curl -L agar jika link diarahkan ulang (redirect), tetap terdownload dengan benar
+        curl -L "${{ github.event.inputs.base_url }}" -o base.zip
 
-      - name: Extract ROM
-        run: |
-          cd work
-          mkdir -p donor
-          unzip -o donor.zip -d donor
-          echo "===== FILE TREE (maxdepth 3) ====="
-          find donor -maxdepth 3 -type f -printf '%p %s\n' | sort
+    - name: Download Port ROM (Infinity X)
+      run: |
+        echo "Mendownload Port ROM..."
+        curl -L "${{ github.event.inputs.port_url }}" -o port.zip
 
-      - name: Inspect image types
-        run: |
-          cd work
-          echo "===== IMAGE TYPE REPORT ====="
-          find donor -type f \
-            \( -name '*.img' -o -name '*.bin' -o -name '*.dat' -o -name '*.new.dat' -o -name '*.new.dat.br' \) \
-            | sort | while IFS= read -r img; do
-              echo "----- $img -----"
-              file "$img"
-              ls -lh "$img"
-              echo
-            done
+    - name: Ekstrak ROM
+      run: |
+        mkdir -p base_folder port_folder
+        echo "Mengekstrak Base ROM..."
+        unzip -q base.zip -d base_folder
+        echo "Mengekstrak Port ROM..."
+        unzip -q port.zip -d port_folder
 
-      - name: Dump metadata & updater-script
-        run: |
-          cd work
-          echo "===== PROPS ====="
-          find donor -type f \( -name 'build.prop' -o -name 'default.prop' \) \
-            -exec sh -c 'echo "### $1"; cat "$1"; echo' _ {} \;
+    - name: Proses Porting (Oplos Partisi System)
+      run: |
+        echo "Menghapus file system lama di Base ROM..."
+        rm -f base_folder/system.new.dat* 
+        rm -f base_folder/system.transfer.list 
+        rm -f base_folder/system.patch.dat
 
-          echo ""
-          echo "===== UPDATER-SCRIPT ====="
-          find donor -path '*com/google/android/updater-script' \
-            -exec cat {} \;
+        echo "Memindahkan file system dari Port ROM ke Base ROM..."
+        cp port_folder/system.new.dat* base_folder/
+        cp port_folder/system.transfer.list base_folder/
+        cp port_folder/system.patch.dat base_folder/
 
-          echo ""
-          echo "===== METADATA ====="
-          find donor -name 'metadata' -type f \
-            -exec sh -c 'echo "### $1"; cat "$1"' _ {} \;
+    - name: Hapus Device Check di Updater-Script
+      run: |
+        SCRIPT_PATH="base_folder/META-INF/com/google/android/updater-script"
+        if [ -f "$SCRIPT_PATH" ]; then
+          echo "Memodifikasi updater-script..."
+          sed -i '/getprop/d' "$SCRIPT_PATH"
+          sed -i '/assert/d' "$SCRIPT_PATH"
+        fi
 
-      - name: Extract .new.dat.br to raw images
-        run: |
-          cd work
-          mkdir -p img
-          for part in system vendor product system_ext odm; do
-            [ -f "donor/${part}.new.dat.br" ] || continue
-            echo "===== $part ====="
-            brotli -d "donor/${part}.new.dat.br" -o "img/${part}.new.dat" || continue
-            python3 /tmp/sdat2img.py \
-              "donor/${part}.transfer.list" \
-              "img/${part}.new.dat" \
-              "img/${part}.img" || continue
-            simg2img "img/${part}.img" "img/${part}.raw.img" 2>/dev/null || \
-              cp "img/${part}.img" "img/${part}.raw.img"
-            ls -lh "img/${part}".*.img
-          done
+    - name: Repack menjadi Flashable Zip
+      run: |
+        echo "Membungkus kembali ROM..."
+        cd base_folder
+        zip -r1 ../${{ github.event.inputs.release_name }}.zip ./*
 
-      - name: Dump partition contents
-        run: |
-          cd work
-          mkdir -p dump
-          for img in img/system.raw.img img/vendor.raw.img \
-                     img/product.raw.img img/system_ext.raw.img img/odm.raw.img; do
-            [ -f "$img" ] || continue
-            name=$(basename "$img" .raw.img)
-            echo "===== dumping $name ====="
-            mkdir -p "dump/$name"
-            debugfs -R "rdump / dump/$name" "$img" 2>/dev/null || \
-              echo "  debugfs failed for $name"
-            echo "  files: $(find dump/$name -type f 2>/dev/null | wc -l)"
-          done
-
-          if [ -f donor/boot.img ]; then
-            echo "===== boot.img info ====="
-            file donor/boot.img
-            abootimg -i donor/boot.img 2>/dev/null || true
-          fi
-
-      - name: Hardware layer report - donor
-        run: |
-          cd work
-          python3 - <<'PY'
-          import re
-          from pathlib import Path
-
-          HW = re.compile(
-              r'(libcamera|libwifi|libril|libsensor|libbt|libgnss|libaudio|'
-              r'libmmcamera|libloc|libqmi|libqti|libdisplay|libgralloc|'
-              r'libmemalloc|libqdutils|libsdm|libthermal|libsensor1|'
-              r'manifest\.xml|file_contexts|property_contexts|'
-              r'hwservice_contexts|init\..*\.rc|fstab|mixer_paths|'
-              r'thermal|media_codecs|audio.*\.xml|qcrild)', re.I
-          )
-
-          def walk(root):
-              p = Path(root)
-              if not p.exists(): return []
-              return sorted(str(f.relative_to(p)) for f in p.rglob('*') if f.is_file())
-
-          parts = ['system','vendor','product','system_ext','odm']
-          all_files = []
-          for p in parts:
-              all_files += [f"{p}/{f}" for f in walk(f'dump/{p}')]
-
-          hw = [f for f in all_files if HW.search(f)]
-
-          print("===== PARTITION LAYOUT =====")
-          for p in parts:
-              files = walk(f'dump/{p}')
-              print(f"\n--- {p} ({len(files)} files) ---")
-              top = sorted({f.split('/')[0] for f in files})
-              for t in top[:60]:
-                  print(f"  {t}")
-
-          print("\n===== DONOR HW FILES =====")
-          for f in hw:
-              print(f)
-
-          print(f"\nTotal HW files: {len(hw)}")
-          PY
-
-      - name: Clone vendor mido & hardware report - vendor
-        env:
-          VENDOR_REPO: ${{ inputs.vendor_repo }}
-        run: |
-          cd work
-          git clone --depth 1 "$VENDOR_REPO" vendor_repo
-          echo "===== VENDOR TOP LEVEL ====="
-          ls -la vendor_repo/
-
-          python3 - <<'PY'
-          import re, os
-          from pathlib import Path
-
-          HW = re.compile(
-              r'(libcamera|libwifi|libril|libsensor|libbt|libgnss|libaudio|'
-              r'libmmcamera|libloc|libqmi|libqti|libdisplay|libgralloc|'
-              r'libmemalloc|libqdutils|libsdm|libthermal|libsensor1|'
-              r'manifest\.xml|file_contexts|property_contexts|'
-              r'hwservice_contexts|init\..*\.rc|fstab|mixer_paths|'
-              r'thermal|media_codecs|audio.*\.xml|qcrild)', re.I
-          )
-
-          def walk(root):
-              p = Path(root)
-              if not p.exists(): return []
-              return sorted(str(f.relative_to(p)) for f in p.rglob('*') if f.is_file())
-
-          vendor_files = walk('vendor_repo')
-          vendor_hw = [f for f in vendor_files if HW.search(f)]
-
-          print("===== VENDOR HW FILES =====")
-          for f in vendor_hw:
-              print(f)
-          print(f"\nTotal vendor HW files: {len(vendor_hw)}")
-
-          donor_hw = []
-          for p in ['system','vendor','product','system_ext','odm']:
-              for f in walk(f'dump/{p}'):
-                  if HW.search(f):
-                      donor_hw.append(f)
-          donor_names = {os.path.basename(f) for f in donor_hw}
-          vendor_names = {os.path.basename(f) for f in vendor_hw}
-
-          missing = sorted(vendor_names - donor_names)
-          print("\n===== HW IN VENDOR BUT NOT IN DONOR =====")
-          for f in missing:
-              print(f)
-          print(f"\nTotal missing: {len(missing)}")
-
-          extra = sorted(donor_names - vendor_names)
-          print("\n===== HW IN DONOR BUT NOT IN VENDOR =====")
-          for f in extra:
-              print(f)
-          print(f"\nTotal extra: {len(extra)}")
-          PY
+    - name: Upload Hasil ke GitHub Releases
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        TAG_NAME="port-$(date +%Y%m%d%H%M%S)"
+        gh release create "$TAG_NAME" \
+          --title "Auto Port: ${{ github.event.inputs.release_name }}" \
+          --notes "Hasil porting otomatis ROM mido." \
+          ${{ github.event.inputs.release_name }}.zip

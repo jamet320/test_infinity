@@ -28,10 +28,8 @@ jobs:
           sudo apt-get install -y \
             aria2 unzip zip p7zip-full brotli lz4 zstd \
             python3 python3-pip file binutils git \
-            android-sdk-libsparse-utils e2fsprogs
+            android-sdk-libsparse-utils e2fsprogs abootimg
           curl -sL https://raw.githubusercontent.com/xpirt/sdat2img/master/sdat2img.py -o /tmp/sdat2img.py
-          git clone --depth 1 https://github.com/osm0sis/mkbootimg /tmp/mkbootimg
-          chmod +x /tmp/mkbootimg/unpackbootimg
 
       - name: Download donor ROM
         env:
@@ -98,11 +96,11 @@ jobs:
           for part in system vendor product system_ext odm; do
             [ -f "donor/${part}.new.dat.br" ] || continue
             echo "===== $part ====="
-            brotli -d "donor/${part}.new.dat.br" -o "img/${part}.new.dat"
+            brotli -d "donor/${part}.new.dat.br" -o "img/${part}.new.dat" || continue
             python3 /tmp/sdat2img.py \
               "donor/${part}.transfer.list" \
               "img/${part}.new.dat" \
-              "img/${part}.img"
+              "img/${part}.img" || continue
             simg2img "img/${part}.img" "img/${part}.raw.img" 2>/dev/null || \
               cp "img/${part}.img" "img/${part}.raw.img"
             ls -lh "img/${part}".*.img
@@ -124,9 +122,9 @@ jobs:
           done
 
           if [ -f donor/boot.img ]; then
-            echo "===== unpacking boot.img ====="
-            /tmp/mkbootimg/unpackbootimg -i donor/boot.img -o dump/boot 2>/dev/null || true
-            ls -la dump/boot/ 2>/dev/null || true
+            echo "===== boot.img info ====="
+            file donor/boot.img
+            abootimg -i donor/boot.img 2>/dev/null || true
           fi
 
       - name: Hardware layer report - donor
@@ -207,7 +205,6 @@ jobs:
               print(f)
           print(f"\nTotal vendor HW files: {len(vendor_hw)}")
 
-          # Donor HW basenames
           donor_hw = []
           for p in ['system','vendor','product','system_ext','odm']:
               for f in walk(f'dump/{p}'):
@@ -222,7 +219,6 @@ jobs:
               print(f)
           print(f"\nTotal missing: {len(missing)}")
 
-          # Files in donor HW but not in vendor (kandidat yang perlu di-keep dari donor)
           extra = sorted(donor_names - vendor_names)
           print("\n===== HW IN DONOR BUT NOT IN VENDOR =====")
           for f in extra:

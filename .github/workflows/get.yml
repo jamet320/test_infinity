@@ -1,0 +1,35 @@
+name: Get Dynamic OP List
+
+on:
+  workflow_dispatch:
+    inputs:
+      port_url:
+        description: 'Link Direct ROM (Infinity X)'
+        required: true
+        default: ''
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Dependencies
+        run: sudo apt-get install -y unzip curl
+
+      - name: Download ROM
+        run: |
+          echo "Mendownload ROM..."
+          curl -sL "${{ github.event.inputs.port_url }}" -o port.zip
+
+      - name: Ekstrak File OP List
+        run: |
+          mkdir hasil
+          echo "Mengekstrak dynamic_partitions_op_list..."
+          # unzip -j cuma bakal narik file spesifik tanpa bikin struktur folder
+          unzip -j port.zip dynamic_partitions_op_list -d hasil/
+
+      - name: Upload sebagai Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: File-OP-List
+          path: hasil/dynamic_partitions_op_list

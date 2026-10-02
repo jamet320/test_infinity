@@ -1,130 +1,295 @@
-name: Auto Port ROM (With Log & Check)
+name: Port Infinity-X A16 Mi8937 -> mido
 
-# Trigger manual dengan input link
 on:
   workflow_dispatch:
     inputs:
-      base_url:
-        description: 'Link Direct Base ROM (mido)'
+      mido_base_url:
+        description: "Direct download URL ROM/base A16 mido"
         required: true
-      port_url:
-        description: 'Link Direct Port ROM (Infinity X)'
-        required: true
-      release_name:
-        description: 'Nama file hasil porting (tanpa .zip)'
-        required: true
-        default: 'Port-InfinityX-Mido'
+        type: string
+
+      keep_gapps:
+        description: "Keep donor GApps"
+        required: false
+        default: true
+        type: boolean
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  port:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
 
     steps:
-    - name: Kosongkan Storage Server (Mencegah out of space)
-      run: |
-        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-        df -h
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            aria2 \
+            android-sdk-libsparse-utils \
+            android-sdk-ext4-utils \
+            lz4 \
+            brotli \
+            zip \
+            unzip \
+            p7zip-full \
+            e2fsprogs \
+            erofs-utils \
+            python3 \
+            python3-pip \
+            git \
+            wget \
+            curl
 
-    - name: Setup & Install Dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y zip unzip curl
+      - name: Download Mi8937 donor
+        env:
+          DONOR_URL: >-
+            https://sourceforge.net/projects/alifc105-roms/files/Mi8937/Infinity%20X/A16/3.12%20GAPPS%20-%2009.09.2026/Project_Infinity-X-3.12-Mi8937-09.09.2026-GAPPS-UNOFFICIAL.zip/download
+        run: |
+          mkdir -p work/{donor,mido,out,tools}
 
-    - name: Download Base ROM (mido)
-      run: |
-        echo "Mendownload Base ROM..."
-        curl -sL "${{ github.event.inputs.base_url }}" -o base.zip
+          aria2c \
+            --allow-overwrite=true \
+            --file-allocation=none \
+            -x16 -s16 \
+            -o donor.zip \
+            "$DONOR_URL"
 
-    - name: Download Port ROM (Infinity X)
-      run: |
-        echo "Mendownload Port ROM..."
-        curl -sL "${{ github.event.inputs.port_url }}" -o port.zip
+          unzip -l donor.zip | head -100
 
-    - name: Ekstrak ROM
-      run: |
-        mkdir -p base_folder port_folder
-        echo "Mengekstrak Base ROM..."
-        unzip -q base.zip -d base_folder
-        echo "Mengekstrak Port ROM..."
-        unzip -q port.zip -d port_folder
+          unzip -q donor.zip -d work/donor
 
-    - name: Deteksi Jenis ROM dan Buat Log
-      run: |
-        echo "=== LAPORAN PROSES PORTING ROM ===" > build_log.txt
-        echo "Tanggal: $(date)" >> build_log.txt
-        echo "==================================" >> build_log.txt
-        
-        echo "[INFO BASE ROM (mido)]" >> build_log.txt
-        if [ -f "base_folder/payload.bin" ]; then
-          echo "-> Tipe: DYNAMIC (Terdapat file payload.bin)" >> build_log.txt
-        elif ls base_folder/system.new.dat* 1> /dev/null 2>&1; then
-          echo "-> Tipe: NON-DYNAMIC (Format konvensional / .dat.br)" >> build_log.txt
-        else
-          echo "-> Tipe: TIDAK DIKETAHUI / Struktur tidak standar" >> build_log.txt
-        fi
-        
-        echo "" >> build_log.txt
-        echo "[INFO PORT ROM (Infinity X)]" >> build_log.txt
-        if [ -f "port_folder/payload.bin" ]; then
-          echo "-> Tipe: DYNAMIC (Terdapat file payload.bin)" >> build_log.txt
-          echo "!! PERINGATAN: Port ROM menggunakan payload.bin. Script ini hanya bisa memindah format non-dynamic. Proses porting kemungkinan besar akan GAGAL !!" >> build_log.txt
-        elif ls port_folder/system.new.dat* 1> /dev/null 2>&1; then
-          echo "-> Tipe: NON-DYNAMIC (Format konvensional / .dat.br)" >> build_log.txt
-        else
-          echo "-> Tipe: TIDAK DIKETAHUI / Struktur tidak standar" >> build_log.txt
-        fi
-        
-        echo "==================================" >> build_log.txt
+      - name: Download mido base
+        env:
+          MIDO_URL: ${{ inputs.mido_base_url }}
+        run: |
+          cd work/mido
 
-    - name: Proses Porting (Oplos Partisi System)
-      run: |
-        echo "[PROSES PEMINDAHAN FILE]" >> build_log.txt
-        
-        # Hapus file sistem lama di base_folder
-        echo "-> Menghapus partisi system lama di Base ROM..." >> build_log.txt
-        rm -f base_folder/system.new.dat* base_folder/system.transfer.list base_folder/system.patch.dat
-        rm -f base_folder/product.new.dat* base_folder/product.transfer.list base_folder/product.patch.dat
-        rm -f base_folder/system_ext.new.dat* base_folder/system_ext.transfer.list base_folder/system_ext.patch.dat
+          aria2c \
+            --allow-overwrite=true \
+            --file-allocation=none \
+            -x16 -s16 \
+            -o mido-base.zip \
+            "$MIDO_URL"
 
-        # Pindahkan file dari port_folder ke base_folder dengan log dinamis
-        for part in system product system_ext; do
-          if ls port_folder/${part}.new.dat* 1> /dev/null 2>&1; then
-            echo "-> Partisi [${part}] DITEMUKAN di Port ROM. Memindahkan ke Base ROM..." >> build_log.txt
-            cp port_folder/${part}.new.dat* base_folder/ 2>/dev/null || true
-            cp port_folder/${part}.transfer.list base_folder/ 2>/dev/null || true
-            cp port_folder/${part}.patch.dat base_folder/ 2>/dev/null || true
-          else
-            echo "-> Partisi [${part}] TIDAK ADA di Port ROM. Diabaikan." >> build_log.txt
+          unzip -q mido-base.zip
+
+          echo "===== MIDO BASE ====="
+          find . -maxdepth 2 -type f | sort | head -200
+
+      - name: Inspect ROM layouts
+        run: |
+          echo "===== DONOR ====="
+          find work/donor -maxdepth 3 -type f | sort
+
+          echo
+          echo "===== MIDO ====="
+          find work/mido -maxdepth 3 -type f | sort
+
+      - name: Extract donor super
+        shell: bash
+        run: |
+          set -eux
+
+          cd work/donor
+
+          if [ -f payload.bin ]; then
+            echo "payload.bin detected"
+
+            git clone --depth=1 \
+              https://github.com/ssut/payload-dumper-go.git \
+              ../tools/payload-dumper-go
+
+            ../tools/payload-dumper-go/payload-dumper-go \
+              payload.bin
+
+            mv output/* .
+            rm -rf output
           fi
-        done
-        
-        echo "==================================" >> build_log.txt
 
-    - name: Hapus Device Check di Updater-Script
-      run: |
-        SCRIPT_PATH="base_folder/META-INF/com/google/android/updater-script"
-        if [ -f "$SCRIPT_PATH" ]; then
-          echo "[MODIFIKASI UPDATER-SCRIPT]" >> build_log.txt
-          echo "-> Menghapus pengecekan device (assert/getprop) agar bisa di-flash di mido." >> build_log.txt
-          sed -i '/getprop/d' "$SCRIPT_PATH"
-          sed -i '/assert/d' "$SCRIPT_PATH"
-        fi
+          if [ -f super.img ]; then
+            echo "super.img detected"
+            mkdir -p super
+            lpunpack super.img super
+          fi
 
-    - name: Repack menjadi Flashable Zip
-      run: |
-        echo "Membungkus kembali ROM..."
-        cd base_folder
-        zip -r1q ../${{ github.event.inputs.release_name }}.zip ./*
-        
-        cd ..
-        echo "-> Proses packing zip selesai!" >> build_log.txt
-        echo "Ukuran File Akhir: $(du -sh ${{ github.event.inputs.release_name }}.zip | cut -f1)" >> build_log.txt
+          echo "===== DONOR PARTITIONS ====="
+          find . -maxdepth 2 -type f | sort
 
-    - name: Upload Hasil Porting & Log sebagai Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ROM-Hasil-Porting
-        # Memasukkan file zip dan txt sekaligus menggunakan multi-line input (|)
-        path: |
-          ${{ github.event.inputs.release_name }}.zip
-          build_log.txt
+      - name: Extract mido super
+        shell: bash
+        run: |
+          set -eux
+
+          cd work/mido
+
+          if [ -f payload.bin ]; then
+            echo "mido payload.bin detected"
+
+            ../tools/payload-dumper-go/payload-dumper-go \
+              payload.bin
+
+            mv output/* .
+            rm -rf output
+          fi
+
+          if [ -f super.img ]; then
+            echo "mido super.img detected"
+            mkdir -p super
+            lpunpack super.img super
+          fi
+
+          echo "===== MIDO PARTITIONS ====="
+          find . -maxdepth 2 -type f | sort
+
+      - name: Find partition images
+        run: |
+          echo "DONOR:"
+          find work/donor -type f \
+            \( -name 'system*.img' \
+            -o -name 'product*.img' \
+            -o -name 'system_ext*.img' \
+            -o -name 'vendor*.img' \
+            -o -name 'odm*.img' \) \
+            -print
+
+          echo
+          echo "MIDO:"
+          find work/mido -type f \
+            \( -name 'system*.img' \
+            -o -name 'product*.img' \
+            -o -name 'system_ext*.img' \
+            -o -name 'vendor*.img' \
+            -o -name 'odm*.img' \) \
+            -print
+
+      - name: Prepare images
+        shell: bash
+        run: |
+          set -eux
+
+          mkdir -p work/port/{donor,mido,mount}
+
+          find work/donor -type f \
+            \( -name 'system*.img' \
+            -o -name 'product*.img' \
+            -o -name 'system_ext*.img' \) \
+            -exec cp {} work/port/donor/ \;
+
+          find work/mido -type f \
+            \( -name 'vendor*.img' \
+            -o -name 'odm*.img' \) \
+            -exec cp {} work/port/mido/ \;
+
+          echo "===== DONOR SYSTEM SIDE ====="
+          ls -lh work/port/donor || true
+
+          echo "===== MIDO HARDWARE SIDE ====="
+          ls -lh work/port/mido || true
+
+      - name: Extract images for port analysis
+        shell: bash
+        run: |
+          set -eux
+
+          for img in work/port/donor/*.img work/port/mido/*.img; do
+            [ -f "$img" ] || continue
+
+            echo
+            echo "===== $img ====="
+
+            file "$img"
+
+            if simg2img "$img" "${img}.raw" 2>/dev/null; then
+              echo "Converted sparse image"
+            else
+              cp "$img" "${img}.raw"
+            fi
+
+            file "${img}.raw"
+          done
+
+      - name: Inspect Android properties
+        shell: bash
+        run: |
+          set -eux
+
+          mkdir -p work/inspect
+
+          for img in work/port/donor/*.raw work/port/mido/*.raw; do
+            [ -f "$img" ] || continue
+
+            name="$(basename "$img")"
+            mkdir -p "work/inspect/$name"
+
+            if sudo mount -o loop,ro "$img" \
+              "work/inspect/$name" 2>/dev/null; then
+
+              echo
+              echo "===== $name ====="
+
+              if [ -f "work/inspect/$name/build.prop" ]; then
+                grep -E \
+                  '^(ro\.build|ro\.product|ro\.vendor|ro\.hardware|ro\.boot|ro\.soc)' \
+                  "work/inspect/$name/build.prop" || true
+              fi
+
+              sudo umount "work/inspect/$name" || true
+            fi
+          done
+
+      - name: Generate port report
+        run: |
+          {
+            echo "# Mi8937 -> mido A16 port report"
+            echo
+            echo "## Donor"
+            unzip -l donor.zip | tail -20
+            echo
+            echo "## Donor partition images"
+            find work/donor -type f -name '*.img' -printf '%p %s bytes\n'
+            echo
+            echo "## Mido partition images"
+            find work/mido -type f -name '*.img' -printf '%p %s bytes\n'
+            echo
+            echo "## Host"
+            uname -a
+            df -h
+          } > work/port-report.md
+
+      - name: Build initial port package
+        shell: bash
+        run: |
+          set -eux
+
+          mkdir -p work/out/MI8937_TO_MIDO
+
+          cp work/port-report.md \
+            work/out/MI8937_TO_MIDO/
+
+          cp donor.zip \
+            work/out/MI8937_TO_MIDO/donor-mi8937.zip
+
+          cat > work/out/MI8937_TO_MIDO/README.txt <<'EOF'
+          Mi8937 -> Redmi Note 4 mido A16 port workspace
+
+          DONOR:
+          Infinity-X 3.12 A16 Mi8937
+
+          IMPORTANT:
+          This is an automated port workspace/report.
+          Hardware-specific Mi8937 vendor/odm/kernel images are NOT
+          blindly flashed to mido.
+
+          The next stage must construct the final mido super image
+          using the verified mido hardware stack.
+          EOF
+
+          cd work/out
+          zip -r ../../mido-a16-port-workspace.zip MI8937_TO_MIDO
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mido-a16-port-workspace
+          path: mido-a16-port-workspace.zip
+          compression-level: 0
